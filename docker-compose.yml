@@ -1,0 +1,46 @@
+services:
+  logging-service:
+    build: .
+    command: python logging_service/retry_testing.py ${FAILURE_PROBABILITY:-0.5}
+    container_name: logging-service
+    ports:
+      - "50051:50051"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+      - FAILURE_PROBABILITY=${FAILURE_PROBABILITY:-0.5}
+    networks:
+      - microservices
+
+  messages-service:
+    build: .
+    command: uvicorn messages_service.main:app --host 0.0.0.0 --port 8002
+    container_name: messages-service
+    ports:
+      - "8002:8002"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+    networks:
+      - microservices
+
+  facade-service:
+    build: .
+    command: uvicorn facade_service.main:app --host 0.0.0.0 --port 8000
+    container_name: facade-service
+    ports:
+      - "8000:8000"
+    depends_on:
+      - logging-service
+      - messages-service
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+      - LOGGING_GRPC_ADDR=logging-service:50051
+      - MESSAGES_HTTP_URL=http://messages-service:8002/messages
+    networks:
+      - microservices
+
+networks:
+  microservices:
+    driver: bridge
