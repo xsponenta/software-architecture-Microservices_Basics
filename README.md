@@ -82,5 +82,4 @@ docker stop hazelcast-1
 docker stop hazelcast-1 hazelcast-2
 ```
 
-Repeat POST/GET and record the result.
 
