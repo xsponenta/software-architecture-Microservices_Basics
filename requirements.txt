@@ -8,3 +8,5 @@ tenacity==8.2.3
 python-multipart==0.0.6
 pyarrow<22.0.0
 protobuf>=5.26.1
+hazelcast-python-client>=5.4.0
+psycopg2-binary>=2.9.9

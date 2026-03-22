@@ -1,14 +1,109 @@
 services:
-  logging-service:
+  hazelcast-1:
+    image: hazelcast/hazelcast:5.3.7
+    container_name: hazelcast-1
+    hostname: hazelcast-1
+    environment:
+      - HZ_CLUSTERNAME=dev
+    volumes:
+      - ./hazelcast/hazelcast.yaml:/opt/hazelcast/config_ext/hazelcast.yaml
+    command: ["/opt/hazelcast/bin/hz-start", "-c", "/opt/hazelcast/config_ext/hazelcast.yaml"]
+    ports:
+      - "5701:5701"
+    networks:
+      - microservices
+
+  hazelcast-2:
+    image: hazelcast/hazelcast:5.3.7
+    container_name: hazelcast-2
+    hostname: hazelcast-2
+    environment:
+      - HZ_CLUSTERNAME=dev
+    volumes:
+      - ./hazelcast/hazelcast.yaml:/opt/hazelcast/config_ext/hazelcast.yaml
+    command: ["/opt/hazelcast/bin/hz-start", "-c", "/opt/hazelcast/config_ext/hazelcast.yaml"]
+    networks:
+      - microservices
+
+  hazelcast-3:
+    image: hazelcast/hazelcast:5.3.7
+    container_name: hazelcast-3
+    hostname: hazelcast-3
+    environment:
+      - HZ_CLUSTERNAME=dev
+    volumes:
+      - ./hazelcast/hazelcast.yaml:/opt/hazelcast/config_ext/hazelcast.yaml
+    command: ["/opt/hazelcast/bin/hz-start", "-c", "/opt/hazelcast/config_ext/hazelcast.yaml"]
+    networks:
+      - microservices
+
+  logging-service-1:
     build: .
-    command: python logging_service/retry_testing.py ${FAILURE_PROBABILITY:-0.5}
-    container_name: logging-service
+    command: python logging_service/main.py
+    container_name: logging-service-1
     ports:
       - "50051:50051"
+    depends_on:
+      - hazelcast-1
+      - hazelcast-2
+      - hazelcast-3
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app
-      - FAILURE_PROBABILITY=${FAILURE_PROBABILITY:-0.5}
+      - INSTANCE_ID=logging-service-1
+      - HAZELCAST_CLUSTER_NAME=dev
+      - HAZELCAST_MEMBERS=hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
+      - HAZELCAST_MAP_NAME=transactions
+    networks:
+      - microservices
+
+  logging-service-2:
+    build: .
+    command: python logging_service/main.py
+    container_name: logging-service-2
+    depends_on:
+      - hazelcast-1
+      - hazelcast-2
+      - hazelcast-3
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+      - INSTANCE_ID=logging-service-2
+      - HAZELCAST_CLUSTER_NAME=dev
+      - HAZELCAST_MEMBERS=hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
+      - HAZELCAST_MAP_NAME=transactions
+    networks:
+      - microservices
+
+  logging-service-3:
+    build: .
+    command: python logging_service/main.py
+    container_name: logging-service-3
+    depends_on:
+      - hazelcast-1
+      - hazelcast-2
+      - hazelcast-3
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+      - INSTANCE_ID=logging-service-3
+      - HAZELCAST_CLUSTER_NAME=dev
+      - HAZELCAST_MEMBERS=hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
+      - HAZELCAST_MAP_NAME=transactions
+    networks:
+      - microservices
+
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      - POSTGRES_DB=transactions
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
     networks:
       - microservices
 
@@ -21,6 +116,13 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=transactions
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+    depends_on:
+      - postgres
     networks:
       - microservices
 
@@ -31,12 +133,14 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      - logging-service
+      - logging-service-1
+      - logging-service-2
+      - logging-service-3
       - messages-service
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app
-      - LOGGING_GRPC_ADDR=logging-service:50051
+      - LOGGING_GRPC_ADDRS=logging-service-1:50051,logging-service-2:50051,logging-service-3:50051
       - MESSAGES_HTTP_URL=http://messages-service:8002/messages
     networks:
       - microservices
@@ -44,3 +148,6 @@ services:
 networks:
   microservices:
     driver: bridge
+
+volumes:
+  postgres-data:
