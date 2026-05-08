@@ -1,7 +1,9 @@
 import grpc
 import os
+import time
 from concurrent import futures
 import hazelcast
+import httpx
 import logging_pb2
 import logging_pb2_grpc
 
@@ -22,6 +24,21 @@ class LoggingService(logging_pb2_grpc.LoggingServiceServicer):
         map_name = os.getenv("HAZELCAST_MAP_NAME", "transactions")
         self.storage = self.client.get_map(map_name).blocking()
         print(f"[{self.instance_id}] Connected to Hazelcast cluster '{cluster_name}' with members: {members}")
+        self.register_in_config_server()
+
+    def register_in_config_server(self):
+        config_server_url = os.getenv("CONFIG_SERVER_URL", "http://config-server:8003")
+        service_address = os.getenv("SERVICE_ADDRESS", f"{self.instance_id}:50051")
+        payload = {"name": "logging-service", "address": service_address}
+        for attempt in range(30):
+            try:
+                response = httpx.post(f"{config_server_url}/register", json=payload, timeout=2)
+                response.raise_for_status()
+                print(f"[{self.instance_id}] registered in config-server as {service_address}")
+                return
+            except Exception as exc:
+                print(f"[{self.instance_id}] config-server registration retry {attempt + 1}: {exc}")
+                time.sleep(1)
 
     def Log(self, request, context):
         if self.storage.contains_key(request.uuid):

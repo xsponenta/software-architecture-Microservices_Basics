@@ -1,86 +1,141 @@
-# Lab 3: Microservices with Hazelcast Distributed Map
+# Lab 4: Microservices with Message Queue
 
-- `logging-service` runs in 3 instances (`logging-service-1..3`)
-- logs are stored in Hazelcast Distributed Map (`transactions`)
-- Hazelcast cluster runs with 3 nodes (`hazelcast-1..3`)
-- `messages-service` uses PostgreSQL as persistent storage
-- `facade-service` randomly selects a logging instance for gRPC requests
-- if the selected instance is unavailable, `facade-service` automatically tries the next one
+This branch implements the `micro_mq` task:
+
+- `facade-service` receives client `POST /send` and `GET /receive` requests.
+- `logging-service` runs in three instances and stores log messages in a Hazelcast Distributed Map.
+- `counter-service` stores transactions in PostgreSQL and maintains account balances.
+- `facade-service` sends counter updates asynchronously through Hazelcast Queue.
+- `config-server` stores service addresses registered at startup.
+- `facade-service` discovers `logging-service` and `counter-service` through `config-server`.
+- Hazelcast runs as a three-node cluster.
 
 ## Run
 
 ```bash
-docker compose up --build
+docker compose up --build -d
 ```
 
 Services:
 
 - `facade-service`: `http://localhost:8000`
-- `messages-service`: `http://localhost:8002`
+- `counter-service`: `http://localhost:8002`
+- `config-server`: `http://localhost:8003`
 - `logging-service-1` gRPC: `localhost:50051`
+- Hazelcast node 1: `localhost:5701`
 - PostgreSQL: `localhost:5432`
-- Hazelcast Node 1: `localhost:5701`
 
-## Post 10 transactions
-
-```bash
-for i in {1..10}; do
-    curl -s -X POST http://localhost:8000/send \
-        -H "Content-Type: application/json" \
-        -d "{\"msg\":\"msg$i\"}"
-    echo
-done
-```
-
-The response includes the `logging_instance` field that shows which instance was selected.
-
-## Get
+If old lab data makes screenshots noisy, start from a clean local database:
 
 ```bash
-curl -s http://localhost:8000/receive | jq
+docker compose down -v --remove-orphans
+docker compose up --build -d
 ```
 
-Returns:
-
-- `logs` — transactions from Hazelcast via logging-service
-- `message.messages` — transactions from PostgreSQL (messages-service)
-
-## Logs of each logging-service instance
+## Check Service Registration
 
 ```bash
-docker logs logging-service-1 --tail 100
-docker logs logging-service-2 --tail 100
-docker logs logging-service-3 --tail 100
+curl -s http://localhost:8003/services
 ```
 
-Each log line contains the instance prefix, for example:
+Expected services:
 
-`[logging-service-2] Logged message: msg4 (uuid=...)`
+- `facade-service`
+- `counter-service`
+- `logging-service` with three addresses
 
-## Resilience testing
-
-### 1) Stop 1-2 logging-service instances
+## Post 10 Transactions
 
 ```bash
-docker stop logging-service-1
-# or
-docker stop logging-service-1 logging-service-2
+curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg1"}'
+curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg2"}'
+curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg3"}'
+curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg4"}'
+curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg5"}'
+curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg6"}'
+curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg7"}'
+curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg8"}'
+curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg9"}'
+curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg10"}'
 ```
 
-Verify that POST/GET through `facade-service` still works:
+Each response includes:
+
+- `logging_instance`: selected logging instance
+- `counter_status`: `queued`
+- `elapsed_ms`: facade processing time
+
+`msg1` through `msg10` are interpreted as amounts `1..10`, so the default account balance becomes `55`.
+You can also send explicit account/amount JSON:
 
 ```bash
-curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"after-stop-logging"}'
-curl -s http://localhost:8000/receive | jq
+curl -s -X POST http://localhost:8000/send \
+  -H "Content-Type: application/json" \
+  -d '{"msg":"deposit", "account":"acc-1", "amount":100}'
 ```
 
-### 2) Stop 1-2 Hazelcast nodes
+## Read Through Facade
 
 ```bash
-docker stop hazelcast-1
-# or
-docker stop hazelcast-1 hazelcast-2
+curl -s http://localhost:8000/receive
 ```
 
-Repeat POST/GET and record the result.
+The response contains:
 
+- `logs`: messages read from Hazelcast Map through one discovered logging instance
+- `counter.transactions`: transactions read from counter-service
+- `counter.balances`: calculated balances
+
+## Show Different Logging Instances
+
+```bash
+docker logs logging-service-1 --tail 50
+docker logs logging-service-2 --tail 50
+docker logs logging-service-3 --tail 50
+```
+
+Each logged message contains the instance prefix, for example:
+
+```text
+[logging-service-2] Logged message: msg5 (uuid=...)
+```
+
+## Counter Failure Test
+
+Pause the counter service:
+
+```bash
+docker pause counter-service
+```
+
+POST still works because facade writes to Hazelcast Queue:
+
+```bash
+curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg11"}'
+curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg12"}'
+```
+
+GET from facade returns unavailable counter values while the counter is paused:
+
+```bash
+curl -s http://localhost:8000/receive
+```
+
+Expected counter part:
+
+```json
+{"transactions": null, "balances": null}
+```
+
+Resume the counter service:
+
+```bash
+docker unpause counter-service
+```
+
+After a few seconds, counter-service consumes the queued transactions and updates balances:
+
+```bash
+docker logs counter-service --tail 50
+curl -s http://localhost:8000/receive
+```
