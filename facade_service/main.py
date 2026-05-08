@@ -12,25 +12,18 @@ from pydantic import BaseModel
 
 import logging_pb2
 import logging_pb2_grpc
+from consul_utils import discover_service, get_csv_kv, get_kv, register_service
 
 app = FastAPI()
 
-CONFIG_SERVER_URL = os.getenv("CONFIG_SERVER_URL", "http://config-server:8003")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "facade-service")
+SERVICE_ID = os.getenv("SERVICE_ID", SERVICE_NAME)
 SERVICE_ADDRESS = os.getenv("SERVICE_ADDRESS", "facade-service:8000")
-COUNTER_QUEUE_NAME = os.getenv("COUNTER_QUEUE_NAME", "counter-transactions")
-HAZELCAST_CLUSTER_NAME = os.getenv("HAZELCAST_CLUSTER_NAME", "dev")
-HAZELCAST_MEMBERS = [
-    member.strip()
-    for member in os.getenv(
-        "HAZELCAST_MEMBERS",
-        "hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701",
-    ).split(",")
-    if member.strip()
-]
+SERVICE_PORT = int(os.getenv("SERVICE_PORT", "8000"))
 
 hazelcast_client = None
 counter_queue = None
+counter_queue_name = None
 
 class Msg(BaseModel):
     msg: str
@@ -38,42 +31,36 @@ class Msg(BaseModel):
     amount: float | None = None
 
 
-async def register_self():
-    payload = {"name": SERVICE_NAME, "address": SERVICE_ADDRESS}
-    async with httpx.AsyncClient() as client:
-        for attempt in range(30):
-            try:
-                response = await client.post(f"{CONFIG_SERVER_URL}/register", json=payload, timeout=2)
-                response.raise_for_status()
-                print(f"[facade-service] registered in config-server as {SERVICE_ADDRESS}")
-                return
-            except Exception as exc:
-                print(f"[facade-service] config-server registration retry {attempt + 1}: {exc}")
-                await asyncio.sleep(1)
-
-
 async def discover(service_name: str) -> list[str]:
-    async with httpx.AsyncClient() as client:
-        response = await client.get(f"{CONFIG_SERVER_URL}/services/{service_name}", timeout=3)
-        response.raise_for_status()
-        addresses = response.json()["addresses"]
-        random.shuffle(addresses)
-        return addresses
+    return await discover_service(service_name)
 
 
 def _init_queue():
-    global hazelcast_client, counter_queue
-    hazelcast_client = hazelcast.HazelcastClient(
-        cluster_name=HAZELCAST_CLUSTER_NAME,
-        cluster_members=HAZELCAST_MEMBERS,
+    global hazelcast_client, counter_queue, counter_queue_name
+    cluster_name = get_kv("config/hazelcast/cluster_name", "dev")
+    members = get_csv_kv(
+        "config/mq/hazelcast_members",
+        "hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701",
     )
-    counter_queue = hazelcast_client.get_queue(COUNTER_QUEUE_NAME).blocking()
-    print(f"[facade-service] connected to Hazelcast queue '{COUNTER_QUEUE_NAME}'")
+    counter_queue_name = get_kv("config/mq/queue_name", "counter-transactions")
+    hazelcast_client = hazelcast.HazelcastClient(
+        cluster_name=cluster_name,
+        cluster_members=members,
+    )
+    counter_queue = hazelcast_client.get_queue(counter_queue_name).blocking()
+    print(f"[facade-service] connected to Hazelcast queue '{counter_queue_name}' with members: {members}")
 
 
 @app.on_event("startup")
 async def startup():
-    await register_self()
+    await asyncio.to_thread(
+        register_service,
+        name=SERVICE_NAME,
+        service_id=SERVICE_ID,
+        address=SERVICE_ADDRESS,
+        port=SERVICE_PORT,
+        tags=["api", "facade"],
+    )
     await asyncio.to_thread(_init_queue)
 
 
@@ -97,7 +84,7 @@ def grpc_send_log_with_failover(addresses: list[str], msg_uuid: str, text: str):
                 stub = logging_pb2_grpc.LoggingServiceStub(channel)
                 response = stub.Log(
                     logging_pb2.LogRequest(uuid=msg_uuid, msg=text),
-                    timeout=20,
+                    timeout=2,
                 )
                 return response.status, addr
         except grpc.RpcError as exc:
@@ -115,7 +102,7 @@ def grpc_get_logs_with_failover(addresses: list[str]):
         try:
             with grpc.insecure_channel(addr) as channel:
                 stub = logging_pb2_grpc.LoggingServiceStub(channel)
-                response = stub.GetLogs(logging_pb2.Empty(), timeout=20)
+                response = stub.GetLogs(logging_pb2.Empty(), timeout=2)
                 return response.logs, addr
         except grpc.RpcError as exc:
             print(f"[WARN] Logging node unavailable: {addr} ({exc.code()})")
@@ -143,7 +130,7 @@ async def root():
         "architecture": {
             "port_8000": "Facade Service",
             "port_8002": "Counter Service",
-            "port_8003": "Config Server",
+            "port_8500": "Consul UI and API",
             "port_50051": "Logging Service (gRPC)"
         }
     }
@@ -155,13 +142,16 @@ async def send_msg(data: Msg):
     
     try:
         logging_addrs = await discover("logging-service")
+        logging_start = time.perf_counter()
         status, selected_addr = await asyncio.to_thread(
             grpc_send_log_with_failover,
             logging_addrs,
             msg_id,
             data.msg,
         )
+        logging_ms = round((time.perf_counter() - logging_start) * 1000, 2)
 
+        queue_start = time.perf_counter()
         await asyncio.to_thread(
             enqueue_counter_message,
             {
@@ -171,13 +161,17 @@ async def send_msg(data: Msg):
                 "amount": data.amount,
             },
         )
+        counter_queue_ms = round((time.perf_counter() - queue_start) * 1000, 2)
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
 
         return {
             "uuid": msg_id,
             "status": status,
             "logging_instance": selected_addr,
             "counter_status": "queued",
-            "elapsed_ms": round((time.perf_counter() - start) * 1000, 2),
+            "elapsed_ms": elapsed_ms,
+            "logging_ms": logging_ms,
+            "counter_queue_ms": counter_queue_ms,
         }
     except Exception as e:
         print(f"[ERROR] Retry failed: {e}")

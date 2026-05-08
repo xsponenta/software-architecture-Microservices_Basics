@@ -1,13 +1,29 @@
 services:
-  config-server:
-    build: .
-    command: uvicorn config_service.main:app --host 0.0.0.0 --port 8003
-    container_name: config-server
+  consul:
+    image: hashicorp/consul:1.20
+    container_name: consul
+    command: agent -server -bootstrap-expect=1 -ui -client=0.0.0.0
     ports:
-      - "8003:8003"
+      - "8500:8500"
+    networks:
+      - microservices
+
+  consul-init:
+    image: hashicorp/consul:1.20
+    container_name: consul-init
+    command:
+      - sh
+      - -c
+      - |
+        until consul kv put config/hazelcast/cluster_name dev; do sleep 1; done
+        consul kv put config/hazelcast/members hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
+        consul kv put config/hazelcast/map_name transactions
+        consul kv put config/mq/hazelcast_members hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
+        consul kv put config/mq/queue_name counter-transactions
     environment:
-      - PYTHONUNBUFFERED=1
-      - PYTHONPATH=/app
+      - CONSUL_HTTP_ADDR=consul:8500
+    depends_on:
+      - consul
     networks:
       - microservices
 
@@ -58,17 +74,20 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app
+      - CONSUL_URL=http://consul:8500
       - INSTANCE_ID=logging-service-1
-      - SERVICE_ADDRESS=logging-service-1:50051
-      - CONFIG_SERVER_URL=http://config-server:8003
-      - HAZELCAST_CLUSTER_NAME=dev
-      - HAZELCAST_MEMBERS=hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
-      - HAZELCAST_MAP_NAME=transactions
+      - SERVICE_ID=logging-service-1
+      - SERVICE_ADDRESS=logging-service-1
+      - SERVICE_PORT=50051
     depends_on:
-      - config-server
-      - hazelcast-1
-      - hazelcast-2
-      - hazelcast-3
+      consul-init:
+        condition: service_completed_successfully
+      hazelcast-1:
+        condition: service_started
+      hazelcast-2:
+        condition: service_started
+      hazelcast-3:
+        condition: service_started
     networks:
       - microservices
 
@@ -79,17 +98,20 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app
+      - CONSUL_URL=http://consul:8500
       - INSTANCE_ID=logging-service-2
-      - SERVICE_ADDRESS=logging-service-2:50051
-      - CONFIG_SERVER_URL=http://config-server:8003
-      - HAZELCAST_CLUSTER_NAME=dev
-      - HAZELCAST_MEMBERS=hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
-      - HAZELCAST_MAP_NAME=transactions
+      - SERVICE_ID=logging-service-2
+      - SERVICE_ADDRESS=logging-service-2
+      - SERVICE_PORT=50051
     depends_on:
-      - config-server
-      - hazelcast-1
-      - hazelcast-2
-      - hazelcast-3
+      consul-init:
+        condition: service_completed_successfully
+      hazelcast-1:
+        condition: service_started
+      hazelcast-2:
+        condition: service_started
+      hazelcast-3:
+        condition: service_started
     networks:
       - microservices
 
@@ -100,17 +122,20 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app
+      - CONSUL_URL=http://consul:8500
       - INSTANCE_ID=logging-service-3
-      - SERVICE_ADDRESS=logging-service-3:50051
-      - CONFIG_SERVER_URL=http://config-server:8003
-      - HAZELCAST_CLUSTER_NAME=dev
-      - HAZELCAST_MEMBERS=hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
-      - HAZELCAST_MAP_NAME=transactions
+      - SERVICE_ID=logging-service-3
+      - SERVICE_ADDRESS=logging-service-3
+      - SERVICE_PORT=50051
     depends_on:
-      - config-server
-      - hazelcast-1
-      - hazelcast-2
-      - hazelcast-3
+      consul-init:
+        condition: service_completed_successfully
+      hazelcast-1:
+        condition: service_started
+      hazelcast-2:
+        condition: service_started
+      hazelcast-3:
+        condition: service_started
     networks:
       - microservices
 
@@ -137,23 +162,27 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app
+      - CONSUL_URL=http://consul:8500
       - SERVICE_NAME=counter-service
-      - SERVICE_ADDRESS=counter-service:8002
-      - CONFIG_SERVER_URL=http://config-server:8003
+      - SERVICE_ID=counter-service
+      - SERVICE_ADDRESS=counter-service
+      - SERVICE_PORT=8002
       - DB_HOST=postgres
       - DB_PORT=5432
       - DB_NAME=transactions
       - DB_USER=postgres
       - DB_PASSWORD=postgres
-      - HAZELCAST_CLUSTER_NAME=dev
-      - HAZELCAST_MEMBERS=hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
-      - COUNTER_QUEUE_NAME=counter-transactions
     depends_on:
-      - config-server
-      - hazelcast-1
-      - hazelcast-2
-      - hazelcast-3
-      - postgres
+      consul-init:
+        condition: service_completed_successfully
+      hazelcast-1:
+        condition: service_started
+      hazelcast-2:
+        condition: service_started
+      hazelcast-3:
+        condition: service_started
+      postgres:
+        condition: service_started
     networks:
       - microservices
 
@@ -164,23 +193,30 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      - config-server
-      - hazelcast-1
-      - hazelcast-2
-      - hazelcast-3
-      - logging-service-1
-      - logging-service-2
-      - logging-service-3
-      - counter-service
+      consul-init:
+        condition: service_completed_successfully
+      hazelcast-1:
+        condition: service_started
+      hazelcast-2:
+        condition: service_started
+      hazelcast-3:
+        condition: service_started
+      logging-service-1:
+        condition: service_started
+      logging-service-2:
+        condition: service_started
+      logging-service-3:
+        condition: service_started
+      counter-service:
+        condition: service_started
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app
+      - CONSUL_URL=http://consul:8500
       - SERVICE_NAME=facade-service
-      - SERVICE_ADDRESS=facade-service:8000
-      - CONFIG_SERVER_URL=http://config-server:8003
-      - HAZELCAST_CLUSTER_NAME=dev
-      - HAZELCAST_MEMBERS=hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
-      - COUNTER_QUEUE_NAME=counter-transactions
+      - SERVICE_ID=facade-service
+      - SERVICE_ADDRESS=facade-service
+      - SERVICE_PORT=8000
     networks:
       - microservices
 

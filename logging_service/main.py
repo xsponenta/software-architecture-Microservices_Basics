@@ -1,44 +1,27 @@
 import grpc
 import os
-import time
 from concurrent import futures
 import hazelcast
-import httpx
 import logging_pb2
 import logging_pb2_grpc
+from consul_utils import get_csv_kv, get_kv, register_service
 
 class LoggingService(logging_pb2_grpc.LoggingServiceServicer):
     def __init__(self):
-        cluster_name = os.getenv("HAZELCAST_CLUSTER_NAME", "dev")
-        members_raw = os.getenv(
-            "HAZELCAST_MEMBERS",
-            "hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701"
+        cluster_name = get_kv("config/hazelcast/cluster_name", "dev")
+        members = get_csv_kv(
+            "config/hazelcast/members",
+            "hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701",
         )
-        members = [member.strip() for member in members_raw.split(",") if member.strip()]
         self.instance_id = os.getenv("INSTANCE_ID", "logging-service")
 
         self.client = hazelcast.HazelcastClient(
             cluster_name=cluster_name,
             cluster_members=members,
         )
-        map_name = os.getenv("HAZELCAST_MAP_NAME", "transactions")
+        map_name = get_kv("config/hazelcast/map_name", "transactions")
         self.storage = self.client.get_map(map_name).blocking()
         print(f"[{self.instance_id}] Connected to Hazelcast cluster '{cluster_name}' with members: {members}")
-        self.register_in_config_server()
-
-    def register_in_config_server(self):
-        config_server_url = os.getenv("CONFIG_SERVER_URL", "http://config-server:8003")
-        service_address = os.getenv("SERVICE_ADDRESS", f"{self.instance_id}:50051")
-        payload = {"name": "logging-service", "address": service_address}
-        for attempt in range(30):
-            try:
-                response = httpx.post(f"{config_server_url}/register", json=payload, timeout=2)
-                response.raise_for_status()
-                print(f"[{self.instance_id}] registered in config-server as {service_address}")
-                return
-            except Exception as exc:
-                print(f"[{self.instance_id}] config-server registration retry {attempt + 1}: {exc}")
-                time.sleep(1)
 
     def Log(self, request, context):
         if self.storage.contains_key(request.uuid):
@@ -55,6 +38,17 @@ class LoggingService(logging_pb2_grpc.LoggingServiceServicer):
         return logging_pb2.LogsResponse(logs=all_msgs)
 
 def serve():
+    instance_id = os.getenv("INSTANCE_ID", "logging-service")
+    service_address = os.getenv("SERVICE_ADDRESS", f"{instance_id}:50051")
+    service_id = os.getenv("SERVICE_ID", instance_id)
+    service_port = int(os.getenv("SERVICE_PORT", "50051"))
+    register_service(
+        name="logging-service",
+        service_id=service_id,
+        address=service_address,
+        port=service_port,
+        tags=["grpc", "logging"],
+    )
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     logging_pb2_grpc.add_LoggingServiceServicer_to_server(LoggingService(), server)
     server.add_insecure_port('0.0.0.0:50051')

@@ -1,78 +1,91 @@
-# Lab 4: Microservices with Message Queue
+# Lab 5: Microservices with Consul
 
-This branch implements the `micro_mq` task:
+This branch implements the `micro_consul` task on top of Lab 4.
 
-- `facade-service` receives client `POST /send` and `GET /receive` requests.
-- `logging-service` runs in three instances and stores log messages in a Hazelcast Distributed Map.
-- `counter-service` stores transactions in PostgreSQL and maintains account balances.
-- `facade-service` sends counter updates asynchronously through Hazelcast Queue.
-- `config-server` stores service addresses registered at startup.
-- `facade-service` discovers `logging-service` and `counter-service` through `config-server`.
-- Hazelcast runs as a three-node cluster.
+- Consul is used as Service Registry, Service Discovery, and Config Server.
+- `facade-service`, `counter-service`, and every `logging-service` instance register themselves in Consul at startup.
+- `facade-service` discovers `logging-service` and `counter-service` through Consul health checks.
+- Hazelcast client settings are stored in Consul KV and read by `logging-service`.
+- Message queue settings are stored in Consul KV and read by `facade-service` and `counter-service`.
+- Hazelcast Queue is still used as the message queue between `facade-service` and `counter-service`.
 
 ## Run
-
-```bash
-docker compose up --build -d
-```
-
-Services:
-
-- `facade-service`: `http://localhost:8000`
-- `counter-service`: `http://localhost:8002`
-- `config-server`: `http://localhost:8003`
-- `logging-service-1` gRPC: `localhost:50051`
-- Hazelcast node 1: `localhost:5701`
-- PostgreSQL: `localhost:5432`
-
-If old lab data makes screenshots noisy, start from a clean local database:
 
 ```bash
 docker compose down -v --remove-orphans
 docker compose up --build -d
 ```
 
-## Check Service Registration
+Services:
+
+- Facade: `http://localhost:8000`
+- Counter: `http://localhost:8002/messages`
+- Consul UI: `http://localhost:8500`
+- Consul services API: `http://localhost:8500/v1/catalog/services`
+
+## Show Running Containers
 
 ```bash
-curl -s http://localhost:8003/services
+docker compose ps
 ```
 
-Expected services:
+Expected containers:
 
+- `consul`
+- `consul-init`
 - `facade-service`
 - `counter-service`
-- `logging-service` with three addresses
+- `logging-service-1`
+- `logging-service-2`
+- `logging-service-3`
+- `hazelcast-1`
+- `hazelcast-2`
+- `hazelcast-3`
+- `postgres`
+
+## Show Consul Registration
+
+```bash
+curl -s http://localhost:8500/v1/catalog/services
+```
+
+```bash
+curl -s "http://localhost:8500/v1/health/service/logging-service?passing=true"
+curl -s "http://localhost:8500/v1/health/service/counter-service?passing=true"
+curl -s "http://localhost:8500/v1/health/service/facade-service?passing=true"
+```
+
+Also open the UI:
+
+```text
+http://localhost:8500/ui
+```
+
+## Show Consul KV Config
+
+```bash
+curl -s 'http://localhost:8500/v1/kv/config/hazelcast/members?raw'
+curl -s 'http://localhost:8500/v1/kv/config/hazelcast/map_name?raw'
+curl -s 'http://localhost:8500/v1/kv/config/mq/hazelcast_members?raw'
+curl -s 'http://localhost:8500/v1/kv/config/mq/queue_name?raw'
+```
 
 ## Post 10 Transactions
 
 ```bash
-curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg1"}'
-curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg2"}'
-curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg3"}'
-curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg4"}'
-curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg5"}'
-curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg6"}'
-curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg7"}'
-curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg8"}'
-curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg9"}'
-curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg10"}'
+for i in {1..10}; do
+  curl -s -X POST http://localhost:8000/send \
+    -H "Content-Type: application/json" \
+    -d "{\"msg\":\"msg$i\"}"
+  echo
+done
 ```
 
 Each response includes:
 
-- `logging_instance`: selected logging instance
-- `counter_status`: `queued`
-- `elapsed_ms`: facade processing time
-
-`msg1` through `msg10` are interpreted as amounts `1..10`, so the default account balance becomes `55`.
-You can also send explicit account/amount JSON:
-
-```bash
-curl -s -X POST http://localhost:8000/send \
-  -H "Content-Type: application/json" \
-  -d '{"msg":"deposit", "account":"acc-1", "amount":100}'
-```
+- `logging_instance`
+- `counter_status: queued`
+- `elapsed_ms`
 
 ## Read Through Facade
 
@@ -80,13 +93,9 @@ curl -s -X POST http://localhost:8000/send \
 curl -s http://localhost:8000/receive
 ```
 
-The response contains:
+For `msg1..msg10`, the default account balance must be `55.0`.
 
-- `logs`: messages read from Hazelcast Map through one discovered logging instance
-- `counter.transactions`: transactions read from counter-service
-- `counter.balances`: calculated balances
-
-## Show Different Logging Instances
+## Show Logging-Service Distribution
 
 ```bash
 docker logs logging-service-1 --tail 50
@@ -94,48 +103,62 @@ docker logs logging-service-2 --tail 50
 docker logs logging-service-3 --tail 50
 ```
 
-Each logged message contains the instance prefix, for example:
+## Performance Test
 
-```text
-[logging-service-2] Logged message: msg5 (uuid=...)
+Run two scenarios required by the task: 10 accounts and 1 account.
+
+```bash
+python3 performance_test.py
 ```
 
-## Counter Failure Test
+The script prints:
 
-Pause the counter service:
+- `wall_time_ms`
+- `avg_total_ms`
+- `avg_logging_ms`
+- `avg_counter_queue_ms`
+
+Use these values in the report table as the Task 5 results. Since `counter-service` is asynchronous in this lab, `avg_counter_queue_ms` is the facade-side contribution for putting the transaction into the message queue.
+
+## Failure Test With Consul
+
+Stop one logging instance:
+
+```bash
+docker stop logging-service-1
+sleep 10
+```
+
+Check Consul health:
+
+```bash
+curl -s "http://localhost:8500/v1/health/service/logging-service"
+```
+
+In the Consul UI, `logging-service-1` should become unhealthy or critical. POST requests still work because `facade-service` asks Consul for passing instances and falls back to another logging instance if one is unavailable.
+
+```bash
+curl -s -X POST http://localhost:8000/send \
+  -H "Content-Type: application/json" \
+  -d '{"msg":"after-logging-pause"}'
+```
+
+Start the logging instance again:
+
+```bash
+docker start logging-service-1
+```
+
+Counter queue failure test:
 
 ```bash
 docker pause counter-service
-```
-
-POST still works because facade writes to Hazelcast Queue:
-
-```bash
 curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg11"}'
 curl -s -X POST http://localhost:8000/send -H "Content-Type: application/json" -d '{"msg":"msg12"}'
-```
-
-GET from facade returns unavailable counter values while the counter is paused:
-
-```bash
 curl -s http://localhost:8000/receive
-```
-
-Expected counter part:
-
-```json
-{"transactions": null, "balances": null}
-```
-
-Resume the counter service:
-
-```bash
 docker unpause counter-service
-```
-
-After a few seconds, counter-service consumes the queued transactions and updates balances:
-
-```bash
-docker logs counter-service --tail 50
+sleep 3
 curl -s http://localhost:8000/receive
 ```
+
+While `counter-service` is paused, the `counter` part of the GET response returns `null` values. After unpause, queued messages are consumed and balances become correct again.

@@ -6,10 +6,10 @@ import threading
 import time
 
 import hazelcast
-import httpx
 import psycopg2
 from fastapi import FastAPI
 from pydantic import BaseModel
+from consul_utils import get_csv_kv, get_kv, register_service
 
 app = FastAPI(title="Counter Service")
 
@@ -18,23 +18,15 @@ DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DB_NAME = os.getenv("DB_NAME", "transactions")
 DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
-CONFIG_SERVER_URL = os.getenv("CONFIG_SERVER_URL", "http://config-server:8003")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "counter-service")
+SERVICE_ID = os.getenv("SERVICE_ID", SERVICE_NAME)
 SERVICE_ADDRESS = os.getenv("SERVICE_ADDRESS", "counter-service:8002")
-COUNTER_QUEUE_NAME = os.getenv("COUNTER_QUEUE_NAME", "counter-transactions")
-HAZELCAST_CLUSTER_NAME = os.getenv("HAZELCAST_CLUSTER_NAME", "dev")
-HAZELCAST_MEMBERS = [
-    member.strip()
-    for member in os.getenv(
-        "HAZELCAST_MEMBERS",
-        "hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701",
-    ).split(",")
-    if member.strip()
-]
+SERVICE_PORT = int(os.getenv("SERVICE_PORT", "8002"))
 
 hazelcast_client = None
 counter_queue = None
 stop_consumer = threading.Event()
+counter_queue_name = None
 
 
 class MessageIn(BaseModel):
@@ -148,7 +140,7 @@ def apply_transaction(data: MessageIn) -> str:
 
 
 def queue_consumer():
-    print(f"[counter-service] consuming Hazelcast queue '{COUNTER_QUEUE_NAME}'")
+    print(f"[counter-service] consuming Hazelcast queue '{counter_queue_name}'")
     while not stop_consumer.is_set():
         try:
             raw = counter_queue.take()
@@ -159,34 +151,33 @@ def queue_consumer():
             time.sleep(1)
 
 
-async def register_self():
-    payload = {"name": SERVICE_NAME, "address": SERVICE_ADDRESS}
-    async with httpx.AsyncClient() as client:
-        for attempt in range(30):
-            try:
-                response = await client.post(f"{CONFIG_SERVER_URL}/register", json=payload, timeout=2)
-                response.raise_for_status()
-                print(f"[counter-service] registered in config-server as {SERVICE_ADDRESS}")
-                return
-            except Exception as exc:
-                print(f"[counter-service] config-server registration retry {attempt + 1}: {exc}")
-                await asyncio.sleep(1)
-
-
 def init_queue():
-    global hazelcast_client, counter_queue
-    hazelcast_client = hazelcast.HazelcastClient(
-        cluster_name=HAZELCAST_CLUSTER_NAME,
-        cluster_members=HAZELCAST_MEMBERS,
+    global hazelcast_client, counter_queue, counter_queue_name
+    cluster_name = get_kv("config/hazelcast/cluster_name", "dev")
+    members = get_csv_kv(
+        "config/mq/hazelcast_members",
+        "hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701",
     )
-    counter_queue = hazelcast_client.get_queue(COUNTER_QUEUE_NAME).blocking()
+    counter_queue_name = get_kv("config/mq/queue_name", "counter-transactions")
+    hazelcast_client = hazelcast.HazelcastClient(
+        cluster_name=cluster_name,
+        cluster_members=members,
+    )
+    counter_queue = hazelcast_client.get_queue(counter_queue_name).blocking()
     threading.Thread(target=queue_consumer, daemon=True).start()
 
 
 @app.on_event("startup")
 async def startup():
     init_db()
-    await register_self()
+    await asyncio.to_thread(
+        register_service,
+        name=SERVICE_NAME,
+        service_id=SERVICE_ID,
+        address=SERVICE_ADDRESS,
+        port=SERVICE_PORT,
+        tags=["worker", "counter"],
+    )
     await asyncio.to_thread(init_queue)
 
 
